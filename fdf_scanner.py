@@ -25,7 +25,7 @@ from fdf_main import Ui_MainWindow
 from ProgressBar import ProgressDlg
 
 
-VersionNumber="0.6"
+VersionNumber="0.8"
 
 
 #   HISTORY
@@ -39,6 +39,9 @@ VersionNumber="0.6"
 #   0.6     Added low-memory hash calculate option
 #           Added force to GUI option rather than having to rename the python program.
 #           As files are scanned, the output file is generated (including database file)
+#   0.7     Progress bar now works again, also, progress bar now shows name of file being hashed and its size
+#           Works the same in gui as console version.
+#   0.8     Bug fix - error on deriving file name in linux environments.
 
 
 
@@ -78,6 +81,19 @@ IsWindows=0
 OutputFileRemark="# "
 OutputFileRemove="rm "
 OutputFileExtension=".sh"
+
+
+def format_bytes(size):
+    # 2**10 = 1024
+    power = 2**10
+    n = 0
+    power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
+    while size > power:
+        size /= power
+        n += 1
+    return str(int(size)) +' '+ power_labels[n]+'b'
+
+
 
 def BinaryChopSearch( SearchString ):
     global OLDFileDB
@@ -137,20 +153,36 @@ def ProgressBar( OutputText, TotalCount=0, CurrentCount=0, BarSize=40, TotalLine
 
     ProgressBar_PROGRESS_1=CurrentCount
 
+    try:
+        columns, rows = os.get_terminal_size(0)
+    except OSError:
+        try:
+            columns, rows = os.get_terminal_size(1)
+        except:
+            columns=80
+            rows=1
+
+    # print ("TotalLineLength:"+str(TotalLineLength)+" rows:"+str(columns))
+
+    if TotalLineLength > columns:
+        TotalLineLength_Used=columns
+    else:
+        TotalLineLength_Used=TotalLineLength
+
     if (time.time() - GlobalTimer) > 1 or ForceOutput==1 :
         #   its been more than 1 sec since last output, so update the screen
 
         if TotalCount>0:
             #   We've got values - do a progressbar
             formatted_name = '\r '+ ( "=" * int(BarSize*(CurrentCount/TotalCount)))+( " " * (BarSize-int(40*(CurrentCount/TotalCount))))+' '+OutputText+(" " * 80)
-            sys.stdout.write(formatted_name[0:TotalLineLength])
+            sys.stdout.write(formatted_name[0:TotalLineLength_Used])
             sys.stdout.flush()
             GlobalTimer = time.time()
 
         else:
             #   No values - simply output the text
             formatted_name = '\r ' + OutputText+(" " * 80)
-            sys.stdout.write(formatted_name[0:TotalLineLength])
+            sys.stdout.write(formatted_name[0:TotalLineLength_Used])
             sys.stdout.flush()
             GlobalTimer = time.time()
 
@@ -165,7 +197,6 @@ def ScanDirectory(walk_dir):
     global DatabaseFile
 
     FileCount = 0
-    FileDelta = 0
 
     #   Go through all the files, but dont follow links
     for root, subdirs, files in os.walk(walk_dir, followlinks=False):
@@ -207,33 +238,6 @@ def ScanDirectory(walk_dir):
                     FileDB.append([filename.upper(), Filepath.replace('/','\\'), timestamp, size, '', 'N'])
                 else:
                     FileDB.append([filename, file_path, time.ctime(mtime), size, '', 'N'])
-
-                FileDelta = FileDelta +1
-
-                if FileDelta > 20 :
-                    FileDelta = 0
-
-                    # We've added 50 files - do a quick process and save.
-
-                    #    Calculate hash values for all files.
-                    # ProgressBar_TEXT = ProgressBar_TEXT+chr(13) + chr(10) +"    Examining files..."
-                    #QApplication.processEvents()
-                    CalculateHashes()
-
-                    #    Locate duplicate files
-                    # ProgressBar_TEXT = ProgressBar_TEXT+chr(13) + chr(10) +"    Locating duplicates..."
-                    # QApplication.processEvents()
-                    LocateDups()
-
-                    #    Generate the output
-                    # ProgressBar_TEXT = ProgressBar_TEXT+chr(13) + chr(10) +"    Generating output file..."
-                    # QApplication.processEvents()
-                    DuplicatesCount=0
-                    GenerateOutput()
-
-                    #    If we've got a database file name, save it
-                    if len(DatabaseFile)>0:
-                        SaveDatabase()
 
 #   Given a full filepath and filename - is this a file thats in the 'preserve' list?
 def CheckPreserve(Fname):
@@ -466,8 +470,11 @@ def CalculateHashes():
     global MD5KeptCount, MD5CalculatedCount, DuplicatesCount
     global IsWindows
     global OutputFileRemark, OutputFileRemove, OutputFileExtension
+    global ProgressBar_TEXT
 
     global ProgressBar_PROGRESS_1
+
+    print("Sorting...")
 
     #    Sort the file information to make it easier to process.
     FileDB.sort(key=lambda x: x[3])
@@ -475,9 +482,18 @@ def CalculateHashes():
     #print("")
     #print("Calculating hashes")
 
+    # Keep a count of files processed - as we generate hashes, save every so often.
+    FileDelta=0
+
+    print ("Matching...")
+
+    # Preserve the value of ProgressBar_TEXT so we can restore when finished
+    Saved_ProgressBar_TEXT=ProgressBar_TEXT
+
+
     for i in range(1,len(FileDB)-1):
 
-        # ProgressBar('Matching files ' + str(i),TotalCount=(len(FileDB)-1),CurrentCount=i),
+        ProgressBar('Matching files ' + str(i),TotalCount=(len(FileDB)-1),CurrentCount=i),
             
         if FileDB[i][3] == FileDB[i+1][3] or FileDB[i][3] == FileDB[i-1][3]:
             try:
@@ -500,13 +516,15 @@ def CalculateHashes():
                     #   No historic match - re-calculate
                     # print("Calculating hash:"+FileDB[i][1])
 
-                    #   If we're calculating a hash of a file > 100Mb it might take a few secs
-                    #   so update the progressbad
-                    if FileDB[i][3] > (1024 * 1024 * 1):
-                        FileCount=len(FileDB)
-                        Fname=FileDB[i][1].rsplit("\\",1)[1]
-                            #print(FileDB[i][1].rsplit("\\", 1)[0])
-                        ProgressBar('FileCount ' + str(FileCount)+ ' calculating hash:'+Fname,ForceOutput=1)
+                    if OS[0:5] == 'Linux':
+                        Fname = FileDB[i][1].rsplit("/", 1)[1]
+                    else:
+                        Fname = FileDB[i][1].rsplit("\\", 1)[1]
+
+                    Fsize = format_bytes(FileDB[i][3])
+
+                    ProgressBar('Matching files ' + str(i)+ ' checking:'+Fname+" ("+Fsize+")", TotalCount=(len(FileDB) - 1), CurrentCount=i ,ForceOutput=1, TotalLineLength=200)
+                    ProgressBar_TEXT = Saved_ProgressBar_TEXT + chr(13) + chr(10) + "    Examining files..."+ chr(13) + chr(10)+'           checking:'+Fname+" ("+Fsize+")"
                     try:
                         #   Is the size too large to fit into memory? (250Mb)
                         if FileDB[i][3] > (1024 * 1024 * 250):
@@ -518,9 +536,38 @@ def CalculateHashes():
                         print('Error (sha256:nomatch):'+FileDB[i][1])  #+' '+sys.exc_info()[0]
                         FileDB[i][4] = "OSERROR"
 
+                    # 0.7 - if we've processed more than 'x' save values.
+                    FileDelta = FileDelta + 1
+
+                    if FileDelta > 100:
+                        FileDelta = 0
+
+                        ProgressBar_TEXT = Saved_ProgressBar_TEXT + chr(13) + chr(10) + "    Examining files..." + chr(13) + chr(10) + '           saving...'
+                        ProgressBar('Matching files ' + str(i) + ' saving... ',
+                                    TotalCount=(len(FileDB) - 1), CurrentCount=i, ForceOutput=1, TotalLineLength=200)
+
+                        # We've added x files - do a quick process and save.
+
+                        #    Locate duplicate files
+                        # ProgressBar_TEXT = ProgressBar_TEXT+chr(13) + chr(10) +"    Locating duplicates..."
+                        # QApplication.processEvents()
+                        LocateDups()
+
+                        #    Generate the output
+                        # ProgressBar_TEXT = ProgressBar_TEXT+chr(13) + chr(10) +"    Generating output file..."
+                        # QApplication.processEvents()
+                        DuplicatesCount = 0
+                        GenerateOutput()
+
+                        #    If we've got a database file name, save it
+                        if len(DatabaseFile) > 0:
+                            SaveDatabase()
+
             except OSError:
                 FileDB[i][4] = "OSERROR"
 
+    # restore ProgressBar_TEXT
+    ProgressBar_TEXT=Saved_ProgressBar_TEXT
 
 
 def LocateDups():
